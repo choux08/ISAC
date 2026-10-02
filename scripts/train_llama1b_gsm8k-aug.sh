@@ -21,8 +21,9 @@ python train.py \
 	--max_grad_norm 2.0 \
 	--use_lora True \
 	--lora_r 128 --lora_alpha 32 --lora_init \
-	--save_strategy "no" \
-	--save_total_limit 1 \
+	--save_strategy "steps" \
+	--save_steps 500 \
+	--save_total_limit 2 \
 	  --save_safetensors False \
 	--weight_decay 0.1 \
 	--warmup_ratio 0.03 \

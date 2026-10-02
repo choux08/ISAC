@@ -78,7 +78,29 @@ def evaluation(model_args, data_args, training_args):
         state_dict = load_file(os.path.join(model_args.ckpt_dir, "model.safetensors"))
     except Exception:
         state_dict = torch.load(os.path.join(model_args.ckpt_dir, "pytorch_model.bin"))
-    model.load_state_dict(state_dict, strict=False)
+
+    # 2026-10-01: see test.py for the full rationale -- strip a DDP-era "module." prefix before
+    # loading, and log missing/unexpected keys instead of letting strict=False swallow a full
+    # key-name mismatch silently.
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+        print(f"[ckpt load] stripped 'module.' prefix from all {len(state_dict)} state_dict keys.")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    lora_missing = [k for k in missing if "lora_" in k]
+    print(
+        f"[ckpt load] {model_args.ckpt_dir}: {len(state_dict)} keys in file, "
+        f"{len(missing)} missing, {len(unexpected)} unexpected."
+    )
+    if lora_missing:
+        print(
+            f"[ckpt load] WARNING: {len(lora_missing)} LoRA keys were NOT loaded from the "
+            "checkpoint (still at random/zero initialization) -- the model is effectively "
+            f"untrained despite --ckpt_dir being set. Sample: {lora_missing[:5]}"
+        )
+    if unexpected:
+        print(f"[ckpt load] Sample unexpected keys in checkpoint (not found in model): {unexpected[:5]}")
+
     model.codi.tie_weights()
     
     tokenizer_path = model_args.model_name_or_path 
@@ -108,21 +130,40 @@ def evaluation(model_args, data_args, training_args):
     answer_name = "answer"
     if "zen-E/GSM8k-Aug" in data_args.data_name:
         dataset = load_dataset(data_args.data_name)
-        test_set = dataset['test']
+        # 2026-10-01: zen-E/GSM8k-Aug-NL (the icot-full/NL variant, used for the llama1b
+        # checkpoints in this repo) only ships a "train" split -- train.py itself loads
+        # load_dataset(...)["train"] for this dataset (see its icot-full branch). The symbolic
+        # zen-E/GSM8k-Aug variant the original probe_latent_token.sh was written against does
+        # have a "test" split; fall back to "train" when "test" isn't present so this probe
+        # (a qualitative interpretability check, not a benchmark number) still runs.
+        test_set = dataset['test'] if 'test' in dataset else dataset['train']
     else:
         raise NotImplementedError
 
     logging.warning("Formatting inputs...")
-    question = [] 
+    question = []
     answer = []
     procedures = []
 
-    # get numerical answer
+    # 2026-10-01: this is a qualitative interpretability probe (decode what each latent
+    # "would say" via the LM head, CODI paper Sec 5), not a benchmark run -- no need to walk
+    # the entire 381755-example "train" fallback split (see above). Cap at a small number of
+    # examples, and skip ones whose answer isn't a plain number (the "train" split, unlike the
+    # original zen-E/GSM8k-Aug "test" split this script was written against, can contain
+    # fraction-style answers like "2/5" that aren't meant for this float-answer comparison
+    # anyway).
+    max_probe_examples = 30
     for example in test_set:
+        if len(question) >= max_probe_examples:
+            break
+        try:
+            ans = float(example[answer_name].replace(",", ""))
+        except (ValueError, AttributeError):
+            continue
         question.append(f"{example[question_name].strip().replace('  ', ' ')}")
-        answer.append(float(example[answer_name].replace(",", "")))
+        answer.append(ans)
         procedures.append(example["cot"])
-        
+
     logging.warning("Tokenizing inputs...")
     eval_step = math.ceil(len(question)/data_args.batch_size)
     logging.warning(f"Total example: {len(question)} | eval batch size: {data_args.batch_size}"
@@ -154,7 +195,7 @@ def evaluation(model_args, data_args, training_args):
 
     model.eval()
     gen_kwargs = {
-        "max_new_tokens": 256,
+        "max_new_tokens": training_args.max_new_tokens,
         "temperature":0.1,
         "top_k": 40,
         "top_p": 0.95,
@@ -299,9 +340,11 @@ def evaluation(model_args, data_args, training_args):
 
             # decode top5_indices_list
             for ii in range(len(top5_indices_list)): # batch
-                do_log=True
-                if int(answer[log_count]) != int(extract_answer_number(tokenizer.decode(pred_tokens[ii]))):
-                    do_log=False
+                # 2026-10-01: temporarily log every example regardless of correctness (not just
+                # correct ones) to compare latent decoding between right and wrong predictions --
+                # revert to the original correctness-gated behavior (do_log=False on mismatch)
+                # once this diagnostic pass is done.
+                do_log = True
                 if do_log:
                     log.append(f"Question{log_count}...")
                     log.append(f"{question[log_count]}...")

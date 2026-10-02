@@ -1,0 +1,20 @@
+{
+  "name": "codi",
+  "version": "1.0.0",
+  "description": "This is the official implementation of the paper: [CODI: Compressing Chain-of-Thought into Continuous Space via Self-Distillation](https://arxiv.org/abs/2502.21074).\r Accepted by EMNLP 2025 🎉",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhenyi4/CODI.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/zhenyi4/CODI/issues"
+  },
+  "homepage": "https://github.com/zhenyi4/CODI#readme"
+}

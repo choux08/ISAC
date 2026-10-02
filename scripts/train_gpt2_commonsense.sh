@@ -20,9 +20,10 @@ python train.py \
 	--learning_rate 3e-3 \
 	--max_grad_norm 2.0 \
 	--lora_r 128 --lora_alpha 32 --lora_init \
-	--save_strategy "no" \
+	--save_strategy "steps" \
+	--save_steps 500 \
 	  --save_safetensors False \
-	--save_total_limit 1 \
+	--save_total_limit 2 \
 	--weight_decay 0.1 \
 	--warmup_ratio 0.03 \
 	--lr_scheduler_type "cosine" \

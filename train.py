@@ -11,6 +11,7 @@ import json
 import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer
+from transformers.trainer_utils import get_last_checkpoint
 from safetensors.torch import load_file
 from tqdm import tqdm
 from math import ceil
@@ -25,13 +26,30 @@ from src.model import (
     TrainingArguments,
     freeze_model
 )
+from src.debug_utils import LossHistoryLogger
 
 IGNORE_INDEX = -100
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
+
+# 2026-08-28: same rationale as src/model.py's IS_MAIN_PROCESS -- under torchrun DDP every
+# rank runs this whole script, so unguarded status prints would otherwise repeat once per
+# GPU. LOCAL_RANK is set by torchrun before this module even imports argparse, and is
+# absent (-> "0") on a plain single-GPU `python train.py` run, so behavior there is
+# unchanged.
+IS_MAIN_PROCESS = os.environ.get("LOCAL_RANK", "0") == "0"
+if IS_MAIN_PROCESS:
+    print(device)
+
 
 class CustomTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Debug instrumentation (src/debug_utils.py): in-memory history + a CSV file
+        # of the core losses, with periodic ASCII sparklines printed to stdout --
+        # visible without tensorboard/network access. Not part of ISAC.md's spec.
+        self._loss_logger = LossHistoryLogger(self.args.output_dir)
+
     def compute_loss(self, model, inputs, num_items_in_batch):
         # Extract the global step from the optimizer
         step = self.state.global_step
@@ -53,7 +71,24 @@ class CustomTrainer(Trainer):
         loss = outputs["loss"]
         #"ce_loss": ce_loss_total, "mse_loss": mse_loss_total, "ref_ce_loss": ref_ce_loss
         if step % self.args.logging_steps == 0:
-            self.log({"loss": loss.item(), "ce_loss": outputs["ce_loss"], "distill_loss": outputs["distill_loss"], "ref_ce_loss": outputs["ref_ce_loss"],})
+            log_dict = {"loss": loss.item(), "ce_loss": outputs["ce_loss"], "distill_loss": outputs["distill_loss"], "ref_ce_loss": outputs["ref_ce_loss"], "att_loss": outputs["att_loss"],}
+            # Debug instrumentation (model.py's use_att_loss path): surfaces how many examples
+            # per batch actually fed att_loss vs. were silently skipped, so a near-zero att_loss
+            # in tensorboard can be told apart from "L_att is starved of examples this step".
+            if "att_loss_num_examples" in outputs:
+                log_dict["att_loss_num_examples"] = outputs["att_loss_num_examples"]
+                log_dict["att_loss_num_skipped_no_cache"] = outputs["att_loss_num_skipped_no_cache"]
+                log_dict["att_loss_num_skipped_no_critical"] = outputs["att_loss_num_skipped_no_critical"]
+            self.log(log_dict)
+            # 2026-08-28: under DDP, compute_loss runs on every rank, and unlike self.log()
+            # (whose callbacks already check is_world_process_zero internally), our
+            # LossHistoryLogger has no such guard -- 4 ranks writing loss_history.csv /
+            # loss_plot.png concurrently would race/corrupt the file. Restrict to rank 0.
+            # Note: this rank's log_dict is its own local-shard loss, not an all-reduced
+            # global average across GPUs -- a reasonable proxy for the sparkline/CSV/plot,
+            # but not exactly the mean loss DDP trains on.
+            if IS_MAIN_PROCESS:
+                self._loss_logger.record(step, log_dict, self.args.logging_steps)
         return loss
 
     def log(self, logs, start_time=None):
@@ -138,7 +173,11 @@ def train():
         )
 
 
+    if IS_MAIN_PROCESS:
+        print(f"[train] constructing CODI model ({model_args.model_name_or_path})...")
     model = CODI(model_args, training_args, lora_config)
+    if IS_MAIN_PROCESS:
+        print("[train] CODI model constructed")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             token=model_args.token,
@@ -164,12 +203,13 @@ def train():
             breakpoint()
 
     def preprocess(
-        sources: Sequence[str], 
-        targets: Sequence[str], 
+        sources: Sequence[str],
+        targets: Sequence[str],
         answers: Sequence[str],
-        tokenizer: transformers.PreTrainedTokenizer, 
+        tokenizer: transformers.PreTrainedTokenizer,
         bot_id: int,
         eot_id: int,
+        raw_indices: Sequence[int],
     ) -> Dict:
         print("Tokenizing inputs... This may take some time...")
         sources_id = _tokenize_fn(sources, tokenizer)["input_ids"]
@@ -211,9 +251,28 @@ def train():
 
         ref_eos_position = [len(x)-1 for x in ref_input_ids]
         model_eos_position = [len(x)-1 for x in answers_id]
+
+        # 2026-10-01: rationale_texts (used only by the L_att step/critical-token indexing,
+        # get_step_and_critical_token_indices -- NOT by cot_id/ref_input_ids/decoder_input_ids
+        # above, which are untouched) now appends "The answer is: X" as its own trailing step
+        # after the CoT steps, instead of excluding it entirely. Must stay byte-for-byte
+        # identical to cache_teacher_attention.py's build_question_and_rationale() so the
+        # cached teacher step/critical-token counts match the student's live counts (ISAC.md
+        # Sec 3.3 invariant) -- the existing teacher attention cache was built under the old
+        # (answer-excluded) definition and must be rebuilt before this takes effect in training,
+        # or every example will silently fail the num_steps/num_critical_tokens match in
+        # CODI.forward() and att_loss_total will stay ~0.
+        att_rationale_texts = []
+        for cot_text, answer_text in zip(targets, answers):
+            cot_text = cot_text.rstrip()
+            if cot_text and not cot_text.endswith("."):
+                cot_text += "."
+            att_rationale_texts.append(f"{cot_text} {answer_text}" if cot_text else answer_text)
+
         return dict(encoder_input_ids=sources_id, decoder_input_ids=answers_id, ref_input_ids=ref_input_ids, labels=answers_id, \
                     ref_answer_position=ref_answer_position, model_answer_position=model_answer_position, \
-                        ref_eos_position=ref_eos_position, model_eos_position=model_eos_position, ref_labels=ref_labels)
+                        ref_eos_position=ref_eos_position, model_eos_position=model_eos_position, ref_labels=ref_labels, \
+                            raw_index=list(raw_indices), question_texts=list(sources), rationale_texts=att_rationale_texts)
 
 
     class SupervisedDataset(Dataset):
@@ -225,12 +284,29 @@ def train():
 
             self.data_name = data_name
             questions, cots, answers = [], [], []
+            raw_indices = []  # ISAC.md Sec 3.5: index into raw_data, matching cache_teacher_attention.py's enumeration
             num_ops_list = []
             operators = ["+", "-", "*", "/"]
 
             token_nums = []
-            for num_iter, example in enumerate(raw_data):
-                if training_args.exp_mode and num_iter > training_args.exp_data_num:
+            if training_args.exp_mode:
+                # 2026-08-28 (user-reported): GSM8k-Aug / GSM8k-Aug-NL augment each of a small
+                # number of base questions into ~50 near-duplicate variants that are contiguous
+                # in the dataset. A front slice (old behavior: break once num_iter > exp_data_num,
+                # i.e. raw_data[:exp_data_num]) therefore only samples the first
+                # exp_data_num/~50 base questions repeated many times over -- not representative
+                # of the full dataset, and prone to overfitting on quick exp_mode validation runs.
+                # Stride evenly across the full dataset instead, so the exp_mode subsample spans
+                # a broad range of base questions. Only affects exp_mode; the exp_mode=False
+                # (real training) path below is untouched.
+                total_n = len(raw_data)
+                stride = max(1, total_n // max(1, training_args.exp_data_num))
+                exp_mode_iterator = ((idx, raw_data[idx]) for idx in range(0, total_n, stride))
+            else:
+                exp_mode_iterator = enumerate(raw_data)
+
+            for num_iter, example in exp_mode_iterator:
+                if training_args.exp_mode and len(questions) >= training_args.exp_data_num:
                     break
                 question = f"{example['question']}"
                 if "icot" in self.data_name and "full" in self.data_name: # icot-full (GSM8k-Aug-NL)
@@ -260,6 +336,7 @@ def train():
                         cot = ""
                     cots.append(cot)
                     answers.append(answer)
+                    raw_indices.append(num_iter)
                 elif "icot" in self.data_name: # icot (GSM8k-Aug)
                     # avoid OOM: remove very long data
                     token_num = len(tokenizer.encode(example["question"] + example["cot"] + example["answer"]))
@@ -285,6 +362,7 @@ def train():
                     questions.append(question)
                     cots.append(" ".join(cot))
                     answers.append(answer)
+                    raw_indices.append(num_iter)
                 elif "commonsense" in self.data_name or "strategy" in self.data_name:
                     question = example['question'].strip() + '\n'
                     cot = example['cot'].strip() + "\n"
@@ -297,6 +375,7 @@ def train():
                     questions.append(question)
                     cots.append(cot)
                     answers.append(answer)
+                    raw_indices.append(num_iter)
                 elif "prontoqa" in data_args.data_name:
                     question = example['question'].strip() + '\n'
                     cot = '\n'.join(example['steps'][:-1]) + "\n"
@@ -309,17 +388,20 @@ def train():
                     questions.append(question)
                     cots.append(cot)
                     answers.append(answer)
+                    raw_indices.append(num_iter)
                 else:
                     raise NotImplementedError
             if training_args.exp_mode:
                 questions = questions[:training_args.exp_data_num]
                 cots = cots[:training_args.exp_data_num]
                 answers = answers[:training_args.exp_data_num]
-            
-            print(f"{len(cots)} data in total...")
+                raw_indices = raw_indices[:training_args.exp_data_num]
+
+            if IS_MAIN_PROCESS:
+                print(f"{len(cots)} data in total...")
             logging.warning("Tokenizing inputs... This may take some time...")
 
-            self.data_dict = preprocess(questions, cots, answers, tokenizer, bot, eot)
+            self.data_dict = preprocess(questions, cots, answers, tokenizer, bot, eot, raw_indices)
             self.keys = list(self.data_dict.keys())
 
 
@@ -337,7 +419,14 @@ def train():
         def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
             encoder_input_ids, decoder_input_ids, ref_input_ids, labels, ref_answer_position, model_answer_position, ref_labels= \
                 tuple([instance[key] for instance in instances] for key in ("encoder_input_ids", "decoder_input_ids", "ref_input_ids", "labels", "ref_answer_position", "model_answer_position", "ref_labels"))
-        
+
+            # ISAC.md Sec 3.5: passed through unpadded (plain lists) -- Trainer._prepare_input
+            # leaves non-tensor entries untouched, and CODI.forward() only reads these when
+            # use_att_loss=True.
+            raw_index = [instance["raw_index"] for instance in instances]
+            question_texts = [instance["question_texts"] for instance in instances]
+            rationale_texts = [instance["rationale_texts"] for instance in instances]
+
             # pad left
             reversed_input_ids = [seq.flip(0) for seq in encoder_input_ids]
             encoder_input_ids = torch.nn.utils.rnn.pad_sequence(reversed_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id).flip(1)
@@ -359,6 +448,9 @@ def train():
                 model_answer_position=torch.tensor(model_answer_position, dtype=torch.long),
                 ref_attention_mask=ref_input_ids.ne(self.tokenizer.pad_token_id),
                 ref_labels=ref_labels,
+                raw_index=raw_index,
+                question_texts=question_texts,
+                rationale_texts=rationale_texts,
             )
 
     def make_supervised_data_module(tokenizer, data_args) -> Dict:
@@ -400,9 +492,29 @@ def train():
         f"seed_{training_args.seed}",
     )
 
+    if IS_MAIN_PROCESS:
+        print("[train] building dataset (tokenizing)...")
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    if IS_MAIN_PROCESS:
+        print(f"[train] dataset ready ({len(data_module['train_dataset'])} examples)")
     trainer = CustomTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-    trainer.train()
+    if IS_MAIN_PROCESS:
+        print("[train] Trainer constructed")
+
+    # Resume from the last mid-training checkpoint if one exists at output_dir (e.g. the
+    # process was killed and the script was re-launched unchanged) -- requires
+    # --save_strategy steps/epoch (see scripts/*.sh); a no-checkpoint run (--save_strategy
+    # no) has nothing to find here and trains from scratch as before.
+    resume_checkpoint = training_args.resume_from_checkpoint
+    if resume_checkpoint is None and os.path.isdir(training_args.output_dir):
+        resume_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if resume_checkpoint is not None and IS_MAIN_PROCESS:
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+    if IS_MAIN_PROCESS:
+        print("[train] calling trainer.train() -- first step is where GPU placement/OOM/scatter errors would surface")
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
+    if IS_MAIN_PROCESS:
+        print("[train] trainer.train() returned -- training finished")
 
     # to avoid the error of saving the model
     #if "llama" in model_args.model_name_or_path:

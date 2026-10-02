@@ -1,0 +1,22 @@
+# Papers / personal notes (copyright / personal, not for the public repo)
+*.pdf
+*.docx
+ISAC_구현_*
+
+# OS / editor junk
+.DS_Store
+.vscode/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs and ad-hoc run artifacts
+*.log
+ISAC_RUNBOOK.txt
+ISAC_RUNBOOK_EN.txt
+
+# Local scratch
+debug_tokenization.py
+classes.png
