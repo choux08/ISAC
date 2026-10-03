@@ -813,7 +813,25 @@ class CODI(torch.nn.Module):
         effective_ref_logits = ref_logits[:, :-1, :]
         effective_ref_logits = effective_ref_logits.reshape(-1, ref_logits.size(-1))
         ref_target_ids = ref_labels[:, 1:].reshape(-1)
-        ref_ce_loss = self.loss_fct(effective_ref_logits, ref_target_ids)
+        if (ref_target_ids != -100).sum() == 0:
+            # nn.CrossEntropyLoss(reduction='mean') with an all-ignore_index target returns a
+            # graph-disconnected 0 (no grad_fn) -- crashes accelerator.backward() with
+            # "element 0 of tensors does not require grad and does not have a grad_fn".
+            # Seen in practice when a long question + --model_max_length truncation eats the
+            # entire CoT+answer for every example in a micro-batch (num_latent=0/MoLSAKI runs,
+            # DDP: one rank's shard can hit this while others look fine). Fall back to a
+            # zero loss that still carries a grad_fn so this step contributes no gradient
+            # instead of crashing the whole run.
+            if self.print_loss:
+                print(
+                    "[WARNING] ref_ce_loss: entire micro-batch has ref_labels fully masked "
+                    "(-100) -- likely truncated by --model_max_length. Using a grad-carrying "
+                    "zero loss for this step instead of crashing. Check data preprocessing / "
+                    "max_token_num if this recurs often."
+                )
+            ref_ce_loss = effective_ref_logits.sum() * 0.0
+        else:
+            ref_ce_loss = self.loss_fct(effective_ref_logits, ref_target_ids)
         ref_ce_loss *= self.ref_loss_factor
         self._decode_preview(ref_logits, ref_labels, "teacher (explicit CoT+answer)", step)
 
